@@ -33,21 +33,19 @@ python -c "import scipy; print('SciPy OK')"   # nếu lỗi vẫn chạy đượ
 
 ## 2. Bắt đầu nhanh (Quickstart)
 
-> ⚠️ **Repo chỉ chứa code + tài liệu, KHÔNG kèm file video/ảnh** (đã `.gitignore`). Bạn tự
-> sinh video test bằng lệnh dưới, hoặc trỏ `--source` tới video của mình. Trong các ví dụ,
-> `video.mp4` chỉ là **tên minh họa** — thay bằng đường dẫn file thật của bạn.
+> ⚠️ **Repo chỉ chứa code + tài liệu, KHÔNG kèm file video/ảnh** (đã `.gitignore`). Trỏ
+> `--source` tới video thực tế của bạn. Trong các ví dụ, `video.mp4` chỉ là **tên minh
+> họa** — thay bằng đường dẫn file thật.
 
-Chạy thử ngay bằng video test tổng hợp (script `make_test_video.py` **tự sinh** `test_input.mp4`)
-— kỳ vọng **đúng 1 cảnh báo** tại t≈8.1s:
+Chạy trên video thực tế, xem cửa sổ debug (chậm 2× để quan sát kỹ):
 
 ```bash
-python make_test_video.py                                   # sinh test_input.mp4
-python spark_detector.py --source test_input.mp4 --show --speed 0.5
+python spark_detector.py --source video.mp4 --show --speed 0.5
 ```
 
 Nếu không có màn hình (server/headless), bỏ `--show` và xuất video kết quả:
 ```bash
-python spark_detector.py --source test_input.mp4 --save out_annotated.mp4
+python spark_detector.py --source video.mp4 --save out_annotated.mp4
 ```
 
 Kết thúc, chương trình in tổng số cảnh báo và mốc thời gian từng cái. Snapshot mỗi lần báo
@@ -91,8 +89,7 @@ python spark_detector.py --source <NGUỒN> [tùy chọn]
 ## 4. Ví dụ thường dùng
 
 ```bash
-# (video.mp4 dưới đây là tên minh họa — thay bằng đường dẫn video của bạn,
-#  hoặc dùng test_input.mp4 sinh từ make_test_video.py)
+# (video.mp4 dưới đây là tên minh họa — thay bằng đường dẫn video thực tế của bạn)
 
 # 1) Xem debug chậm 2× trên video
 python spark_detector.py --source video.mp4 --show --speed 0.5
@@ -152,7 +149,6 @@ Camera grayscale 1 kênh: đặt `use_color_gate: False` (color gate cần ảnh
 ```
 SparkD/
 ├── spark_detector.py     # Toàn bộ pipeline + CLI (CONFIG ở đầu file)
-├── make_test_video.py    # Sinh video test tổng hợp 4 kịch bản
 ├── SparkDet.md           # Review tổng hợp thuật toán + hạn chế + hướng cải thiện
 ├── README.md             # File này — cài đặt & hướng dẫn chạy
 ├── requirements.txt
