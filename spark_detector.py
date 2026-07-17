@@ -16,7 +16,13 @@ Phiên bản cải tiến từ thiết kế trong SparkDet.md, đã xử lý cá
   #8  Spark tốc độ cao              → dự đoán vị trí theo vận tốc + cổng match nới theo tốc độ
   #9  Báo động kép (phản chiếu)     → alert cooldown toàn cục
 
-Cách dùng:
+Thiết kế để NHÚNG vào project khác: phần lõi là class SparkDetector — nhận
+frame BGR qua process_frame(frame, t=...), trả về dict kết quả; không tự quản
+lý luồng video (project chủ tự lo capture/reconnect). Với luồng live, truyền
+t = thời gian thật (giây); với video file có thể bỏ trống. process_frame có
+guard chống crash: frame None/rỗng, frame grayscale, đổi độ phân giải giữa chừng.
+
+Cách dùng standalone (test):
   python spark_detector.py --source video.mp4 --show
   python spark_detector.py --source anh_folder/ --show          (test ảnh tĩnh)
   python spark_detector.py --source video.mp4 --save out.mp4
@@ -27,7 +33,6 @@ import argparse
 import glob
 import os
 import sys
-import time
 from dataclasses import dataclass, field
 
 import cv2
@@ -39,67 +44,12 @@ try:
 except ImportError:
     HAS_SCIPY = False
 
-
-# =====================================================================
-# CONFIG — toàn bộ tham số tune tại đây
-# =====================================================================
-CONFIG = {
-    # --- Nguồn ---
-    "fps_fallback": 15.0,          # dùng khi video không khai báo FPS
-
-    # --- ROI ---
-    "roi_polygon": None,           # [(x, y), ...] hoặc None = toàn khung hình
-
-    # --- Background subtraction ---
-    "bg_method": "MOG2",           # "MOG2" | "KNN"
-    "bg_history": 500,
-    "bg_var_threshold": 16,
-    "bg_detect_shadows": False,
-    "bg_protect_sparks": True,     # fix #1: không cho model học vùng spark
-
-    # --- Brightness gate ---
-    "brightness_mode": "adaptive",       # "adaptive" | "fixed"
-    "min_absolute_brightness": 200,      # dùng khi "fixed", và là trần khởi tạo cho adaptive
-    "adaptive_offset": 40,               # ngưỡng = p99(nền) + offset
-    "adaptive_floor": 160,               # không cho ngưỡng tụt dưới mức này
-    "adaptive_ceil": 250,
-    "adaptive_update_every_s": 2.0,
-
-    # --- Color gate (fix #3) ---
-    "use_color_gate": True,
-    "warm_hue_max": 45,            # H (OpenCV 0-180): 0-45 = đỏ/cam/vàng
-    "white_sat_max": 60,           # S thấp = gần trắng → pass bất kể hue
-
-    # --- Contour / area ---
-    "min_area": 2,
-    "max_area": 400,
-    "dilate_kernel_size": 3,
-    "dilate_iterations": 1,
-
-    # --- Temporal tracker (fix #2: tính bằng giây) ---
-    "min_duration_s": 0.06,        # khoảng detection đầu→cuối >= mức này → xác nhận
-                                   # (0.06 = 2 frame liên tiếp ở 15fps đủ confirm)
-    "max_duration_s": 2.0,         # tồn tại > mức này → coi là nguồn sáng tĩnh (None = tắt)
-    "min_travel_px": 3,            # spark phải DI CHUYỂN; đèn bật đứng yên bị loại (0 = tắt)
-    "track_base_match_dist_px": 25,
-    "track_init_match_dist_px": 70,  # cổng match khi track mới 1 detection (vận tốc
-                                     # chưa biết) — spark nhanh cần cổng rộng để không
-                                     # bị vỡ thành track mới mỗi frame
-    "track_velocity_gain": 1.5,    # fix #8: cổng match = base + gain * |v| (px/frame)
-    "track_max_missed_frames": 2,
-
-    # --- Global illumination guard (fix #5) ---
-    "global_change_ratio": 0.35,   # >35% ROI là foreground → coi là đổi sáng toàn cảnh
-    "global_adapt_lr": 0.05,       # learning rate tăng tốc để model thích nghi lại
-
-    # --- Warm-up (fix #6) ---
-    "warmup_s": 3.0,
-
-    # --- Cảnh báo ---
-    "alert_cooldown_s": 5.0,       # fix #9: gộp các báo động sát nhau
-    "save_alert_snapshots": True,
-    "snapshot_dir": "alerts",
-}
+# CONFIG mặc định tách riêng tại spark_config.py (nhúng vào project khác thì
+# copy cả 2 file). Import kiểu kép để chạy được cả dạng script lẫn trong package.
+try:
+    from spark_config import CONFIG
+except ImportError:
+    from .spark_config import CONFIG
 
 
 # =====================================================================
@@ -244,28 +194,78 @@ class SparkDetector:
         self.brightness_thr = float(cfg["min_absolute_brightness"])
         self._last_adaptive_update = -1e9
         self._last_alert_t = -1e9
-        self.tracker = CentroidTracker(cfg)
+
+        # process_scale "auto" cần biết kích thước frame → khởi tạo lười ở
+        # frame đầu tiên (_ensure_scaled_cfg). Tham số pixel trong config khai
+        # theo ảnh GỐC, được quy đổi 1 lần sang không gian ảnh đã thu nhỏ.
+        self.scale = None
+        self.cfg_p = None              # config trong không gian xử lý (đã scale)
+        self.tracker = None
         self.alerts = []               # log các lần báo động
 
-        if cfg["bg_method"].upper() == "KNN":
-            self.bg = cv2.createBackgroundSubtractorKNN(
-                history=cfg["bg_history"],
-                dist2Threshold=cfg["bg_var_threshold"] * 25.0,
-                detectShadows=cfg["bg_detect_shadows"])
-        else:
-            self.bg = cv2.createBackgroundSubtractorMOG2(
-                history=cfg["bg_history"],
-                varThreshold=cfg["bg_var_threshold"],
-                detectShadows=cfg["bg_detect_shadows"])
+        self._frame_shape = None       # để phát hiện đổi độ phân giải giữa chừng
+        self.bg = self._make_bg()
 
         k = cfg["dilate_kernel_size"]
         self.dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
 
+    def _make_bg(self):
+        cfg = self.cfg
+        if cfg["bg_method"].upper() == "KNN":
+            return cv2.createBackgroundSubtractorKNN(
+                history=cfg["bg_history"],
+                dist2Threshold=cfg["bg_var_threshold"] * 25.0,
+                detectShadows=cfg["bg_detect_shadows"])
+        return cv2.createBackgroundSubtractorMOG2(
+            history=cfg["bg_history"],
+            varThreshold=cfg["bg_var_threshold"],
+            detectShadows=cfg["bg_detect_shadows"])
+
+    def _reset_pipeline(self):
+        """Đổi độ phân giải giữa chừng (camera đổi profile stream...) →
+        mask/model/tracker cũ đều vô nghĩa, khởi tạo lại thay vì crash."""
+        self.bg = self._make_bg()
+        self.roi_mask = None
+        self.cfg_p = None
+        self.tracker = None
+        self.scale = None
+
     # -----------------------------------------------------------------
+    def _ensure_scaled_cfg(self, frame_shape):
+        """Khởi tạo scale + config đã quy đổi ở frame đầu tiên."""
+        if self.cfg_p is not None:
+            return
+        cfg = self.cfg
+        s_raw = cfg.get("process_scale", "auto")
+        if s_raw == "auto":
+            s = min(1.0, 960.0 / frame_shape[1])
+        else:
+            s = float(s_raw)
+        self.scale = s
+        cfg_p = dict(cfg)
+        cfg_p["min_area"] = cfg["min_area"] * s * s
+        cfg_p["max_area"] = cfg["max_area"] * s * s
+        cfg_p["track_base_match_dist_px"] = cfg["track_base_match_dist_px"] * s
+        cfg_p["track_init_match_dist_px"] = cfg["track_init_match_dist_px"] * s
+        cfg_p["min_travel_px"] = cfg["min_travel_px"] * s
+        if cfg.get("roi_polygon"):
+            cfg_p["roi_polygon"] = [(int(x * s), int(y * s))
+                                    for x, y in cfg["roi_polygon"]]
+        cfg_p["exclude_rects"] = [tuple(int(v * s) for v in r)
+                                  for r in cfg.get("exclude_rects", [])]
+        self.cfg_p = cfg_p
+        self.tracker = CentroidTracker(cfg_p)
+
     def _build_roi_mask(self, shape):
-        mask = np.zeros(shape[:2], dtype=np.uint8)
-        pts = np.array(self.cfg["roi_polygon"], dtype=np.int32)
-        cv2.fillPoly(mask, [pts], 255)
+        """Mask = polygon ROI (hoặc toàn khung) TRỪ các exclude_rects (OSD...)."""
+        if self.cfg_p.get("roi_polygon"):
+            mask = np.zeros(shape[:2], dtype=np.uint8)
+            pts = np.array(self.cfg_p["roi_polygon"], dtype=np.int32)
+            cv2.fillPoly(mask, [pts], 255)
+        else:
+            mask = np.full(shape[:2], 255, dtype=np.uint8)
+        for (x, y, w, h) in self.cfg_p.get("exclude_rects", []):
+            mask[y:y + h, x:x + w] = 0
         return mask
 
     def _color_mask(self, frame_bgr):
@@ -296,15 +296,39 @@ class SparkDetector:
         self._last_adaptive_update = now
 
     # -----------------------------------------------------------------
-    def process_frame(self, frame_bgr):
-        """Trả về dict: tracks, confirmed, alert (bool), debug masks, trạng thái."""
+    def process_frame(self, frame_bgr, t=None):
+        """Trả về dict: tracks, confirmed, alert (bool), debug masks, trạng thái.
+
+        t: timestamp (giây) — bắt buộc truyền với luồng live (RTSP) vì frame có
+        thể bị drop; mặc định None = tính từ frame_idx/fps (đúng cho file video).
+        """
         cfg = self.cfg
-        now = self.frame_idx / self.fps
+        now = t if t is not None else self.frame_idx / self.fps
         self.frame_idx += 1
 
+        # ---- Guards đầu vào: nhúng vào project khác thì không được crash ----
+        if frame_bgr is None or frame_bgr.size == 0:
+            return self._result(now, status="bad_frame")
+        if frame_bgr.ndim == 2:                      # nguồn grayscale
+            frame_bgr = cv2.cvtColor(frame_bgr, cv2.COLOR_GRAY2BGR)
+        elif frame_bgr.shape[2] == 4:                # nguồn BGRA
+            frame_bgr = cv2.cvtColor(frame_bgr, cv2.COLOR_BGRA2BGR)
+        if (self._frame_shape is not None
+                and frame_bgr.shape[:2] != self._frame_shape):
+            print(f"[spark_detector] Độ phân giải đổi "
+                  f"{self._frame_shape} → {frame_bgr.shape[:2]}, reset pipeline")
+            self._reset_pipeline()
+        self._frame_shape = frame_bgr.shape[:2]
+        self._ensure_scaled_cfg(frame_bgr.shape)
+
+        # Thu nhỏ ảnh xử lý (tọa độ output sẽ được quy về ảnh gốc khi vẽ/log)
+        if self.scale != 1.0:
+            frame_bgr = cv2.resize(frame_bgr, None, fx=self.scale, fy=self.scale,
+                                   interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
-        if cfg["roi_polygon"] is not None and self.roi_mask is None:
+        need_mask = cfg.get("roi_polygon") or cfg.get("exclude_rects")
+        if need_mask and self.roi_mask is None:
             self.roi_mask = self._build_roi_mask(gray.shape)
         if self.roi_mask is not None:
             gray = cv2.bitwise_and(gray, gray, mask=self.roi_mask)
@@ -347,7 +371,7 @@ class SparkDetector:
         detections = []
         for c in contours:
             area = cv2.contourArea(c)
-            if cfg["min_area"] <= area <= cfg["max_area"]:
+            if self.cfg_p["min_area"] <= area <= self.cfg_p["max_area"]:
                 x, y, w, h = cv2.boundingRect(c)
                 detections.append((x + w / 2.0, y + h / 2.0, (x, y, w, h)))
 
@@ -378,9 +402,11 @@ class SparkDetector:
             if not t.alerted:
                 t.alerted = True
                 notified = now - self._last_alert_t >= cfg["alert_cooldown_s"]
+                # bbox trong log quy về tọa độ ảnh GỐC
+                bbox_orig = tuple(int(round(v / self.scale)) for v in t.bbox)
                 self.alerts.append({
                     "time_s": round(now, 2), "frame": self.frame_idx - 1,
-                    "track_id": t.track_id, "bbox": t.bbox,
+                    "track_id": t.track_id, "bbox": bbox_orig,
                     "notified": notified})
                 if notified:
                     alert = True
@@ -397,6 +423,8 @@ class SparkDetector:
             "tracks": tracks or [], "confirmed": confirmed or [],
             "alert": alert, "fg_mask": fg_mask, "combined_mask": combined,
             "brightness_thr": self.brightness_thr,
+            # track coords đang ở không gian đã scale (1.0 nếu chưa khởi tạo)
+            "scale": self.scale if self.scale else 1.0,
         }
 
 
@@ -405,13 +433,15 @@ class SparkDetector:
 # =====================================================================
 def annotate(frame, result, cfg):
     out = frame.copy()
+    inv = 1.0 / result.get("scale", 1.0)   # track coords → tọa độ ảnh gốc
     if cfg["roi_polygon"] is not None:
         pts = np.array(cfg["roi_polygon"], dtype=np.int32)
         cv2.polylines(out, [pts], True, (255, 200, 0), 1)
+    for (ex, ey, ew, eh) in cfg.get("exclude_rects", []):
+        cv2.rectangle(out, (ex, ey), (ex + ew, ey + eh), (80, 80, 80), 1)
 
     for t in result["tracks"]:
-        x, y, w, h = t.bbox
-        x, y = int(x), int(y)
+        x, y, w, h = (int(round(v * inv)) for v in t.bbox)
         if t.static_light:
             color, label = (128, 128, 128), f"#{t.track_id} static"
         elif t.confirmed:
@@ -420,7 +450,7 @@ def annotate(frame, result, cfg):
             # Nhãn debug: s = span detection (giây), d = quãng di chuyển (px)
             # → nhìn là biết thiếu điều kiện nào để confirm
             color = (0, 255, 255)
-            label = f"#{t.track_id}? s={t.span_s():.2f} d={t.max_travel:.0f}"
+            label = f"#{t.track_id}? s={t.span_s():.2f} d={t.max_travel * inv:.0f}"
         cv2.rectangle(out, (x - 2, y - 2), (x + w + 2, y + h + 2), color, 2)
         cv2.putText(out, label, (x, max(y - 6, 12)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
