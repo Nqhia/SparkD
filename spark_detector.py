@@ -249,19 +249,24 @@ class SparkDetector:
         cfg_p["track_init_match_dist_px"] = cfg["track_init_match_dist_px"] * s
         cfg_p["min_travel_px"] = cfg["min_travel_px"] * s
         if cfg.get("roi_polygon"):
-            cfg_p["roi_polygon"] = [(int(x * s), int(y * s))
-                                    for x, y in cfg["roi_polygon"]]
+            # Chấp nhận 1 polygon [(x,y),...] hoặc nhiều [[(x,y),...], ...] —
+            # chuẩn hóa nội bộ thành list-of-polygons
+            roi = cfg["roi_polygon"]
+            polys = roi if isinstance(roi[0][0], (list, tuple)) else [roi]
+            cfg_p["roi_polygon"] = [[(int(x * s), int(y * s)) for x, y in poly]
+                                    for poly in polys]
         cfg_p["exclude_rects"] = [tuple(int(v * s) for v in r)
                                   for r in cfg.get("exclude_rects", [])]
         self.cfg_p = cfg_p
         self.tracker = CentroidTracker(cfg_p)
 
     def _build_roi_mask(self, shape):
-        """Mask = polygon ROI (hoặc toàn khung) TRỪ các exclude_rects (OSD...)."""
+        """Mask = union các polygon ROI (hoặc toàn khung) TRỪ exclude_rects."""
         if self.cfg_p.get("roi_polygon"):
             mask = np.zeros(shape[:2], dtype=np.uint8)
-            pts = np.array(self.cfg_p["roi_polygon"], dtype=np.int32)
-            cv2.fillPoly(mask, [pts], 255)
+            for poly in self.cfg_p["roi_polygon"]:   # đã chuẩn hóa nested
+                pts = np.array(poly, dtype=np.int32)
+                cv2.fillPoly(mask, [pts], 255)
         else:
             mask = np.full(shape[:2], 255, dtype=np.uint8)
         for (x, y, w, h) in self.cfg_p.get("exclude_rects", []):
@@ -434,9 +439,12 @@ class SparkDetector:
 def annotate(frame, result, cfg):
     out = frame.copy()
     inv = 1.0 / result.get("scale", 1.0)   # track coords → tọa độ ảnh gốc
-    if cfg["roi_polygon"] is not None:
-        pts = np.array(cfg["roi_polygon"], dtype=np.int32)
-        cv2.polylines(out, [pts], True, (255, 200, 0), 1)
+    if cfg["roi_polygon"]:
+        roi = cfg["roi_polygon"]
+        polys = roi if isinstance(roi[0][0], (list, tuple)) else [roi]
+        for poly in polys:
+            cv2.polylines(out, [np.array(poly, dtype=np.int32)],
+                          True, (255, 200, 0), 1)
     for (ex, ey, ew, eh) in cfg.get("exclude_rects", []):
         cv2.rectangle(out, (ex, ey), (ex + ew, ey + eh), (80, 80, 80), 1)
 

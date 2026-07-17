@@ -20,7 +20,8 @@ CONFIG = {
     "fps_fallback": 15.0,          # dùng khi video không khai báo FPS
 
     # --- ROI ---
-    "roi_polygon": None,           # [(x, y), ...] hoặc None = toàn khung hình
+    "roi_polygon": None,           # 1 vùng [(x, y), ...] hoặc nhiều vùng
+                                   # [[(x, y), ...], ...]; None = toàn khung hình
     "exclude_rects": [],           # [(x, y, w, h), ...] vùng LOẠI TRỪ. QUAN TRỌNG với
                                    # camera thật: khoanh chữ OSD (timestamp nhảy số =
                                    # nguồn báo giả vô tận) và bề mặt kính/bóng
